@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Phase 3 Paper Trading Engine — Web Deployment Version
+Phase 3 Paper Trading Engine — Web Deployment Version (v2)
 =======================================================
 Same trading logic as the original phase3_paper_trader.py, restructured so it
 can run as an always-on web service on a free host (e.g. Render) with:
   - a protected /run endpoint that a free external cron pings once a day
-  - a public "/" dashboard page showing current holdings + performance
+  - a public "/" dashboard page showing current holdings + performance,
+    now with best-effort LIVE intraday repricing and a 30s auto-refresh
   - state stored in Upstash Redis (REST API) instead of a local JSON file,
     because free web hosts wipe local disk on every restart/redeploy.
+  - a Telegram push notification fired every time /run actually executes
 
 Environment variables required (set these in Render's dashboard, no yaml):
   UPSTASH_REDIS_REST_URL     - from your Upstash database page
   UPSTASH_REDIS_REST_TOKEN   - from your Upstash database page
-  RUN_SECRET                 - any password you make up, protects /run
+  RUN_SECRET                 - any password you make up, protects /run and /reset
+  TELEGRAM_BOT_TOKEN         - from @BotFather (optional — alerts silently skip if unset)
+  TELEGRAM_CHAT_ID           - the chat/user/channel id to push alerts to (optional)
 """
 
+import copy
 import json
 import os
 from datetime import datetime, date
@@ -45,6 +50,12 @@ HORIZONS = [
 
 STATE_KEY = "phase3:paper_state"
 RUN_SECRET = os.environ.get("RUN_SECRET", "change-me")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Palette used for the live "active allocation" bar (cycled per ticker).
+ALLOC_PALETTE = ["#00ff9d", "#4ea8de", "#f0b429", "#c792ea", "#ff6b9d", "#5fd4a8"]
+ALLOC_CASH_COLOR = "#3a3f4b"
 
 app = Flask(__name__)
 
@@ -86,14 +97,29 @@ def default_state():
         "equity_curve": [],
         "spy_shares_ref": None,
         "last_dashboard": None,
+        "cash_yield_accum": 0.0,
+        "peak_equity": STARTING_CAPITAL,
     }
 
 
 def load_state():
-    raw = redis_cmd("GET", STATE_KEY)
+    try:
+        raw = redis_cmd("GET", STATE_KEY)
+    except Exception:
+        # Upstash unreachable / misconfigured — fail soft into a fresh,
+        # in-memory-only state so the dashboard can still render something.
+        return default_state()
     if not raw:
         return default_state()
-    return json.loads(raw)
+    try:
+        state = json.loads(raw)
+    except Exception:
+        return default_state()
+    # Backfill any new fields for state written by older versions of this app.
+    defaults = default_state()
+    for key, val in defaults.items():
+        state.setdefault(key, val)
+    return state
 
 
 def save_state(state):
@@ -101,14 +127,131 @@ def save_state(state):
 
 
 # ----------------------------------------------------------------------
+# 0b. TELEGRAM ALERTS
+# ----------------------------------------------------------------------
+def send_telegram_alert(message):
+    """Best-effort push notification. Never raises — a failed/unconfigured
+    Telegram integration must never break the daily /run job."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        return resp.ok
+    except Exception:
+        return False
+
+
+def build_alert_message(run_date, state, metrics, orders, positions_out, prev_equity):
+    equity = metrics["total_equity"]
+    daily_pl = equity - prev_equity
+    daily_pl_pct = (daily_pl / prev_equity * 100) if prev_equity else 0.0
+
+    lines = [
+        f"*Phase 3 Paper Trader — {run_date}*",
+        "",
+        f"*Total Equity:* ${equity:,.2f}",
+        f"*Daily P/L:* {daily_pl:+,.2f} ({daily_pl_pct:+.2f}%)",
+        f"*All-Time P/L:* {metrics['total_pl_pct']:+.2f}%",
+        f"*Cash Sweep Yield (to date):* ${metrics.get('cash_yield_collected', 0.0):,.2f}",
+        "",
+    ]
+
+    if orders:
+        lines.append("*Executed Rebalances:*")
+        for o in orders:
+            lines.append(f"  \u2022 {o['action']} {o['ticker']} — {o['shares']:.4f} sh (${o['value']:,.2f})")
+    else:
+        lines.append("_No rebalancing trades executed today._")
+
+    lines.append("")
+    lines.append("*Current Holdings:*")
+    if positions_out:
+        for p in positions_out:
+            lines.append(
+                f"  \u2022 {p['ticker']}: {p['weight_pct']:.1f}% "
+                f"(${p['market_value']:,.2f}, {p['unrealized_pl_pct']:+.2f}%)"
+            )
+    else:
+        lines.append("  \u2022 Fully in cash")
+
+    if metrics.get("spy_total_pl_pct") is not None:
+        lines.append("")
+        lines.append(
+            f"*Benchmark (SPY):* {metrics['spy_total_pl_pct']:+.2f}% "
+            f"vs *Strategy:* {metrics['total_pl_pct']:+.2f}% "
+            f"({metrics.get('benchmark_delta_pct', 0.0):+.2f}pp)"
+        )
+
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
 # 1. DATA
 # ----------------------------------------------------------------------
 def fetch_price_history():
+    """End-of-day history used by the signal engine (unchanged)."""
     all_tickers = TICKERS + [BENCHMARK]
     session = curl_requests.Session(impersonate="chrome")
     raw = yf.download(all_tickers, period=f"{HISTORY_DAYS}d", session=session, progress=False)
     close_df = raw["Close"].ffill().bfill()
     return close_df
+
+
+def fetch_live_quotes(tickers):
+    """Best-effort intraday price fetch for the dashboard.
+
+    Tries 1-minute intraday bars first (real-time-ish while the market is
+    open). If that comes back empty for a ticker — market closed, weekend,
+    holiday, or a transient rate limit — falls back to the most recent daily
+    close for that ticker. Returns a (possibly partial) {ticker: price} dict
+    and never raises, so a market-data hiccup can't take the dashboard down.
+    """
+    prices = {}
+    try:
+        session = curl_requests.Session(impersonate="chrome")
+        raw = yf.download(
+            tickers, period="1d", interval="1m", session=session,
+            progress=False, threads=True,
+        )
+        if raw is not None and not raw.empty and "Close" in raw:
+            close_df = raw["Close"]
+            if isinstance(close_df, pd.Series):
+                close_df = close_df.to_frame(name=tickers[0])
+            for t in tickers:
+                if t in close_df and not close_df[t].dropna().empty:
+                    prices[t] = float(close_df[t].dropna().iloc[-1])
+    except Exception:
+        pass
+
+    missing = [t for t in tickers if t not in prices]
+    if missing:
+        try:
+            session = curl_requests.Session(impersonate="chrome")
+            raw2 = yf.download(
+                missing, period="5d", interval="1d", session=session,
+                progress=False, threads=True,
+            )
+            if raw2 is not None and not raw2.empty and "Close" in raw2:
+                close_df2 = raw2["Close"]
+                if isinstance(close_df2, pd.Series):
+                    close_df2 = close_df2.to_frame(name=missing[0])
+                for t in missing:
+                    if t in close_df2 and not close_df2[t].dropna().empty:
+                        prices[t] = float(close_df2[t].dropna().iloc[-1])
+        except Exception:
+            pass
+
+    return prices
 
 
 # ----------------------------------------------------------------------
@@ -178,14 +321,18 @@ def compute_target_weights_today(close_df, tickers=TICKERS, horizons=HORIZONS, t
 
 
 # ----------------------------------------------------------------------
-# 3. REBALANCE (unchanged)
+# 3. REBALANCE (extended: tracks cash-sweep yield accrual + executed orders)
 # ----------------------------------------------------------------------
 def rebalance(state, target_weights, prices, run_date):
-    state["cash"] += state["cash"] * DAILY_CASH_RATE
+    yield_amt = state["cash"] * DAILY_CASH_RATE
+    state["cash"] += yield_amt
+    state["cash_yield_accum"] = state.get("cash_yield_accum", 0.0) + yield_amt
 
     equity = state["cash"] + sum(
         pos["shares"] * prices[t] for t, pos in state["positions"].items() if t in prices
     )
+
+    orders = []
 
     for ticker in TICKERS:
         price = prices.get(ticker)
@@ -217,12 +364,14 @@ def rebalance(state, target_weights, prices, run_date):
                 pos["open_date"] = run_date
             pos["shares"] = new_shares
             state["cash"] -= delta_value
+            orders.append({"ticker": ticker, "action": "BUY", "shares": delta_shares, "value": delta_value})
         else:
             sell_shares = min(-delta_shares, pos["shares"])
             realized = sell_shares * (price - pos["avg_cost"])
             pos["realized_pl_accum"] += realized
             pos["shares"] -= sell_shares
             state["cash"] += sell_shares * price
+            orders.append({"ticker": ticker, "action": "SELL", "shares": sell_shares, "value": sell_shares * price})
 
             if pos["shares"] <= 1e-6:
                 total_cost_basis = pos["cost_basis_accum"] if pos["cost_basis_accum"] > 0 else 1e-9
@@ -231,6 +380,7 @@ def rebalance(state, target_weights, prices, run_date):
                     "ticker": ticker,
                     "open_date": pos["open_date"],
                     "close_date": run_date,
+                    "close_price": round(price, 2),
                     "pl": round(pos["realized_pl_accum"], 2),
                     "pl_pct": round(pl_pct, 2),
                     "win": pos["realized_pl_accum"] > 0,
@@ -242,11 +392,11 @@ def rebalance(state, target_weights, prices, run_date):
 
     state["positions"] = {t: p for t, p in state["positions"].items() if p["shares"] > 1e-6}
     state["last_run"] = run_date
-    return state
+    return state, orders
 
 
 # ----------------------------------------------------------------------
-# 4. METRICS (unchanged)
+# 4. METRICS (extended: peak equity / drawdown, cash yield, benchmark delta)
 # ----------------------------------------------------------------------
 def compute_metrics(state, prices, spy_price):
     positions_out = []
@@ -281,9 +431,25 @@ def compute_metrics(state, prices, spy_price):
     best = max((t["pl_pct"] for t in closed), default=0.0)
     worst = min((t["pl_pct"] for t in closed), default=0.0)
 
+    if len(losses) > 0:
+        win_loss_ratio = len(wins) / len(losses)
+    elif len(wins) > 0:
+        win_loss_ratio = float("inf")
+    else:
+        win_loss_ratio = 0.0
+
     if state.get("spy_shares_ref") is None and spy_price:
         state["spy_shares_ref"] = state["starting_capital"] / spy_price
     spy_equity = (state["spy_shares_ref"] * spy_price) if state.get("spy_shares_ref") and spy_price else None
+    spy_total_pl_pct = (
+        round((spy_equity - state["starting_capital"]) / state["starting_capital"] * 100, 2)
+        if spy_equity else None
+    )
+
+    # Peak equity / drawdown tracking.
+    peak_equity = max(state.get("peak_equity", state["starting_capital"]), equity)
+    state["peak_equity"] = peak_equity
+    max_drawdown_pct = ((equity - peak_equity) / peak_equity * 100) if peak_equity else 0.0
 
     metrics = {
         "total_equity": round(equity, 2),
@@ -291,13 +457,20 @@ def compute_metrics(state, prices, spy_price):
         "total_pl": round(total_pl, 2),
         "total_pl_pct": round(total_pl_pct, 2),
         "win_rate_pct": round(win_rate, 2),
+        "win_loss_ratio": win_loss_ratio,
         "num_closed_trades": len(closed),
         "num_wins": len(wins),
         "num_losses": len(losses),
         "best_trade_pct": round(best, 2),
         "worst_trade_pct": round(worst, 2),
         "spy_equity": round(spy_equity, 2) if spy_equity else None,
-        "spy_total_pl_pct": round((spy_equity - state["starting_capital"]) / state["starting_capital"] * 100, 2) if spy_equity else None,
+        "spy_total_pl_pct": spy_total_pl_pct,
+        "benchmark_delta_pct": (
+            round(total_pl_pct - spy_total_pl_pct, 2) if spy_total_pl_pct is not None else None
+        ),
+        "peak_equity": round(peak_equity, 2),
+        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "cash_yield_collected": round(state.get("cash_yield_accum", 0.0), 2),
     }
     return positions_out, metrics, equity, spy_equity
 
@@ -311,6 +484,8 @@ def run_job():
 
     if state.get("last_run") == run_date:
         return {"status": "already ran today", "run_date": run_date}
+
+    prev_equity = state["equity_curve"][-1]["equity"] if state.get("equity_curve") else state["starting_capital"]
 
     close_df = fetch_price_history()
 
@@ -326,7 +501,7 @@ def run_job():
         spy_price = float(close_df[BENCHMARK].dropna().iloc[-1])
 
     target_weights = compute_target_weights_today(close_df)
-    state = rebalance(state, target_weights, prices, run_date)
+    state, orders = rebalance(state, target_weights, prices, run_date)
 
     # Extra read-only data for the dashboard's signal board. This does not
     # feed back into target_weights or rebalance() above — it just re-derives
@@ -361,9 +536,17 @@ def run_job():
         "metrics": metrics,
         "target_weights_today": {k: round(v, 3) for k, v in target_weights.items()},
         "signal_board": signal_board,
+        "orders": orders,
     }
 
     save_state(state)
+
+    try:
+        alert_msg = build_alert_message(run_date, state, metrics, orders, positions_out, prev_equity)
+        send_telegram_alert(alert_msg)
+    except Exception:
+        pass  # a notification failure must never fail the job
+
     return {"status": "ran", "run_date": run_date, "metrics": metrics}
 
 
@@ -377,17 +560,17 @@ DASHBOARD_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=JetBrains+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap');
 
 :root {
-  --bg: #0b0e14;
-  --surface: #10141c;
-  --surface-raised: #161b26;
-  --border: #1e2530;
+  --bg: #111115;
+  --surface: #1E1E24;
+  --surface-raised: #26262e;
+  --border: #2c2c36;
   --text: #e9ecf2;
   --text-dim: #8890a0;
-  --text-faint: #4e5563;
+  --text-faint: #565c6b;
   --fast: #f0b429;
   --slow: #4ea8de;
-  --gain: #5fd4a8;
-  --loss: #e8735c;
+  --gain: #00ff9d;
+  --loss: #ff4a4a;
 }
 
 * { box-sizing: border-box; }
@@ -413,6 +596,8 @@ body {
   border-bottom: 1px solid var(--border);
   padding-bottom: 20px;
   margin-bottom: 28px;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 .eyebrow {
   display: block;
@@ -440,7 +625,17 @@ body {
 .dot {
   width: 7px; height: 7px; border-radius: 50%;
   background: var(--gain);
-  box-shadow: 0 0 0 3px rgba(95, 212, 168, 0.15);
+  box-shadow: 0 0 0 3px rgba(0, 255, 157, 0.15);
+}
+.dot--stale {
+  background: var(--text-faint);
+  box-shadow: 0 0 0 3px rgba(86, 92, 107, 0.15);
+}
+.refresh-note {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-top: 2px;
 }
 
 .hero {
@@ -508,8 +703,8 @@ body {
   background: var(--surface-raised);
 }
 .sig-cell--live {
-  border-color: rgba(95, 212, 168, 0.35);
-  background: linear-gradient(180deg, rgba(95, 212, 168, 0.07), rgba(95, 212, 168, 0.02));
+  border-color: rgba(0, 255, 157, 0.35);
+  background: linear-gradient(180deg, rgba(0, 255, 157, 0.08), rgba(0, 255, 157, 0.02));
 }
 .sig-ticker {
   font-family: 'JetBrains Mono', monospace;
@@ -542,7 +737,7 @@ body {
 
 .stat-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
   margin-bottom: 24px;
 }
@@ -589,6 +784,31 @@ body {
 }
 .chart-legend span { display: flex; align-items: center; gap: 6px; }
 .swatch { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+
+.alloc-bar {
+  display: flex;
+  width: 100%;
+  height: 28px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.alloc-seg {
+  height: 100%;
+  min-width: 2px;
+  transition: width 0.4s ease;
+}
+.alloc-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
+.alloc-legend span { display: flex; align-items: center; gap: 6px; }
+.alloc-swatch { width: 9px; height: 9px; border-radius: 3px; display: inline-block; }
 
 .tables { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 @media (max-width: 760px) { .tables { grid-template-columns: 1fr; } }
@@ -640,8 +860,8 @@ DASHBOARD_JS = """
 var d = window.__CHART_DATA__;
 var ctx = document.getElementById('equityChart');
 var gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 260);
-gradient.addColorStop(0, 'rgba(95, 212, 168, 0.25)');
-gradient.addColorStop(1, 'rgba(95, 212, 168, 0)');
+gradient.addColorStop(0, 'rgba(0, 255, 157, 0.25)');
+gradient.addColorStop(1, 'rgba(0, 255, 157, 0)');
 
 new Chart(ctx, {
   type: 'line',
@@ -651,7 +871,7 @@ new Chart(ctx, {
       {
         label: 'Strategy',
         data: d.equity,
-        borderColor: '#5fd4a8',
+        borderColor: '#00ff9d',
         backgroundColor: gradient,
         fill: true,
         borderWidth: 2,
@@ -661,7 +881,7 @@ new Chart(ctx, {
       {
         label: 'SPY buy & hold',
         data: d.spy,
-        borderColor: '#4e5563',
+        borderColor: '#565c6b',
         borderDash: [4, 3],
         borderWidth: 1.5,
         pointRadius: 0,
@@ -676,11 +896,25 @@ new Chart(ctx, {
     interaction: { mode: 'index', intersect: false },
     plugins: { legend: { display: false } },
     scales: {
-      x: { grid: { display: false }, ticks: { color: '#4e5563', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
-      y: { grid: { color: '#1e2530' }, ticks: { color: '#4e5563' } }
+      x: { grid: { display: false }, ticks: { color: '#565c6b', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
+      y: { grid: { color: '#2c2c36' }, ticks: { color: '#565c6b' } }
     }
   }
 });
+"""
+
+# Small, dependency-free countdown so the page visibly ticks down to its
+# next 30s auto-refresh (the actual reload is done by the <meta refresh> tag).
+REFRESH_TICKER_JS = """
+(function() {
+  var secs = 30;
+  var el = document.getElementById('refreshCountdown');
+  if (!el) return;
+  setInterval(function () {
+    secs = secs > 0 ? secs - 1 : 0;
+    el.textContent = secs + 's';
+  }, 1000);
+})();
 """
 
 
@@ -706,16 +940,43 @@ def reset_endpoint():
     return {"status": "reset"}
 
 
-def _page_shell(body_html, extra_scripts=""):
+def _page_shell(body_html, extra_scripts="", auto_refresh=True):
     """Wraps body content with the static head/CSS (safe, unescaped braces)."""
+    refresh_meta = "<meta http-equiv='refresh' content='30'>" if auto_refresh else ""
     return (
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        + refresh_meta +
         "<title>Phase 3 Paper Trader</title>"
         "<script src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js'></script>"
         "<style>" + DASHBOARD_CSS + "</style></head><body><div class='wrap'>"
         + body_html + "</div>" + extra_scripts + "</body></html>"
     )
+
+
+def _build_allocation_bar(positions_out, cash, equity):
+    """Returns (bar_html, legend_html) for the active-allocation visual bar."""
+    if equity <= 0:
+        return "<div class='alloc-seg' style='width:100%; background:%s;'></div>" % ALLOC_CASH_COLOR, ""
+
+    segments = []
+    legend = []
+    for i, p in enumerate(positions_out):
+        if p["weight_pct"] <= 0:
+            continue
+        color = ALLOC_PALETTE[i % len(ALLOC_PALETTE)]
+        segments.append(f"<div class='alloc-seg' style='width:{p['weight_pct']:.2f}%; background:{color};'></div>")
+        legend.append(
+            f"<span><span class='alloc-swatch' style='background:{color};'></span>{p['ticker']} {p['weight_pct']:.1f}%</span>"
+        )
+
+    cash_pct = max(0.0, (cash / equity * 100)) if equity else 0.0
+    segments.append(f"<div class='alloc-seg' style='width:{cash_pct:.2f}%; background:{ALLOC_CASH_COLOR};'></div>")
+    legend.append(
+        f"<span><span class='alloc-swatch' style='background:{ALLOC_CASH_COLOR};'></span>Cash sweep {cash_pct:.1f}%</span>"
+    )
+
+    return "".join(segments), "".join(legend)
 
 
 @app.route("/")
@@ -731,15 +992,59 @@ def dashboard():
             "Once the daily cron job fires, positions and performance will show up here.</p>"
             "</div>"
         )
-        return Response(_page_shell(body), mimetype="text/html")
+        return Response(_page_shell(body, auto_refresh=True), mimetype="text/html")
 
-    metrics = dash["metrics"]
-    positions = dash["positions"]
+    all_tickers = TICKERS + [BENCHMARK]
+
+    # --- best-effort live intraday repricing --------------------------------
+    # We work on a deep copy so a live-price blip never corrupts the real,
+    # persisted state (only /run is allowed to mutate + save that).
+    live_prices = {}
+    try:
+        live_prices = fetch_live_quotes(all_tickers)
+    except Exception:
+        live_prices = {}
+
+    working_state = copy.deepcopy(state)
+    is_live = any(t in live_prices for t in TICKERS)
+
+    if is_live:
+        # Use a live price where we have one, otherwise fall back to the
+        # last known close for that ticker so nothing silently drops to $0.
+        prices = {}
+        last_known = {p["ticker"]: p["last_price"] for p in dash.get("positions", [])}
+        for t in TICKERS:
+            if t in live_prices:
+                prices[t] = live_prices[t]
+            elif t in last_known:
+                prices[t] = last_known[t]
+
+        spy_price = live_prices.get(BENCHMARK)
+        if spy_price is None:
+            ref = working_state.get("spy_shares_ref")
+            prev_spy_equity = dash["metrics"].get("spy_equity")
+            if ref and prev_spy_equity is not None:
+                spy_price = prev_spy_equity / ref
+    else:
+        prices = {p["ticker"]: p["last_price"] for p in dash.get("positions", [])}
+        spy_price = None
+        ref = working_state.get("spy_shares_ref")
+        prev_spy_equity = dash["metrics"].get("spy_equity")
+        if ref and prev_spy_equity is not None:
+            spy_price = prev_spy_equity / ref
+
+    try:
+        positions_out, metrics, equity, spy_equity = compute_metrics(working_state, prices, spy_price)
+    except Exception:
+        positions_out, metrics = dash["positions"], dash["metrics"]
+        equity = metrics["total_equity"]
+        is_live = False
+
     board = dash.get("signal_board", [])
     curve = state.get("equity_curve", [])
     closed = state.get("closed_trades", [])
 
-    # --- signal board cells ---
+    # --- signal board cells (targets from the last daily rebalance) --------
     board_cells = []
     for c in board:
         live_class = " sig-cell--live" if c["allocated"] else ""
@@ -763,11 +1068,19 @@ def dashboard():
         )
     board_html = "".join(board_cells) or "<div class='muted-cell'>No signal data yet</div>"
 
-    # --- stat chips ---
+    # --- stat chips (now including drawdown, cash yield, benchmark delta) --
     pl_class = "gain" if metrics["total_pl"] >= 0 else "loss"
+    dd_class = "loss" if metrics.get("max_drawdown_pct", 0.0) < 0 else "gain"
+    wl_ratio = metrics.get("win_loss_ratio", 0.0)
+    wl_display = "∞" if wl_ratio == float("inf") else f"{wl_ratio:.2f}"
+
     chips = [
         f"<div class='stat-chip'><span>Cash</span><b class='mono'>${metrics['cash']:,.2f}</b></div>",
+        f"<div class='stat-chip'><span>Peak equity</span><b class='mono'>${metrics.get('peak_equity', metrics['total_equity']):,.2f}</b></div>",
+        f"<div class='stat-chip'><span>Max drawdown</span><b class='mono {dd_class}'>{metrics.get('max_drawdown_pct', 0.0):.2f}%</b></div>",
+        f"<div class='stat-chip'><span>Cash yield collected</span><b class='mono gain'>${metrics.get('cash_yield_collected', 0.0):,.2f}</b></div>",
         f"<div class='stat-chip'><span>Win rate</span><b class='mono'>{metrics['win_rate_pct']:.1f}%</b></div>",
+        f"<div class='stat-chip'><span>Win/Loss ratio</span><b class='mono'>{wl_display}</b></div>",
         f"<div class='stat-chip'><span>Closed trades</span><b class='mono'>{metrics['num_closed_trades']} <span style='color:var(--text-dim); font-size:12px;'>({metrics['num_wins']}W/{metrics['num_losses']}L)</span></b></div>",
         f"<div class='stat-chip'><span>Best trade</span><b class='mono gain'>{metrics['best_trade_pct']:+.2f}%</b></div>",
         f"<div class='stat-chip'><span>Worst trade</span><b class='mono loss'>{metrics['worst_trade_pct']:+.2f}%</b></div>",
@@ -777,32 +1090,44 @@ def dashboard():
         chips.append(
             f"<div class='stat-chip'><span>SPY buy &amp; hold</span><b class='mono {spy_class}'>{metrics['spy_total_pl_pct']:+.2f}%</b></div>"
         )
+    if metrics.get("benchmark_delta_pct") is not None:
+        delta_class = "gain" if metrics["benchmark_delta_pct"] >= 0 else "loss"
+        chips.append(
+            f"<div class='stat-chip'><span>Vs. benchmark</span><b class='mono {delta_class}'>{metrics['benchmark_delta_pct']:+.2f}pp</b></div>"
+        )
     stat_row_html = "".join(chips)
 
-    # --- positions table ---
-    if positions:
+    # --- active allocation bar -----------------------------------------------
+    alloc_bar_html, alloc_legend_html = _build_allocation_bar(positions_out, metrics["cash"], equity)
+
+    # --- positions table ------------------------------------------------------
+    if positions_out:
         pos_rows = "".join(
             f"<tr><td class='ticker-cell'>{p['ticker']}</td>"
             f"<td>{p['shares']}</td><td>${p['avg_cost']:,.2f}</td>"
             f"<td>${p['last_price']:,.2f}</td><td>${p['market_value']:,.2f}</td>"
             f"<td class='{'gain' if p['unrealized_pl'] >= 0 else 'loss'}'>{p['unrealized_pl_pct']:+.2f}%</td>"
             f"<td>{p['weight_pct']:.1f}%</td></tr>"
-            for p in positions
+            for p in positions_out
         )
     else:
         pos_rows = "<tr><td class='muted-cell' colspan='7'>Fully in cash — no open positions</td></tr>"
 
-    # --- closed trades table ---
+    # --- closed trades table (now with exit price + $ P/L) -------------------
     if closed:
         trade_rows = "".join(
             f"<tr><td class='ticker-cell'>{t['ticker']}</td><td>{t['open_date']}</td><td>{t['close_date']}</td>"
+            f"<td>${t.get('close_price', 0):,.2f}</td>"
+            f"<td class='{'gain' if t['win'] else 'loss'}'>${t['pl']:,.2f}</td>"
             f"<td class='{'gain' if t['win'] else 'loss'}'>{t['pl_pct']:+.2f}%</td></tr>"
             for t in reversed(closed[-20:])
         )
     else:
-        trade_rows = "<tr><td class='muted-cell' colspan='4'>No closed trades yet</td></tr>"
+        trade_rows = "<tr><td class='muted-cell' colspan='6'>No closed trades yet</td></tr>"
 
     hero_delta_class = "gain" if metrics["total_pl_pct"] >= 0 else "loss"
+    status_dot_class = "dot" if is_live else "dot dot--stale"
+    status_label = "Live intraday" if is_live else f"Last close &middot; {dash['as_of']}"
 
     body = f"""
 <header class="topbar">
@@ -810,7 +1135,10 @@ def dashboard():
     <span class="eyebrow">Phase 3 &middot; Trend Ensemble &middot; {', '.join(TICKERS)}</span>
     <h1>Paper portfolio</h1>
   </div>
-  <div class="asof"><span class="dot"></span>Synced {dash['as_of']}</div>
+  <div>
+    <div class="asof"><span class="{status_dot_class}"></span>{status_label}</div>
+    <div class="refresh-note">auto-refresh in <span id="refreshCountdown">30s</span></div>
+  </div>
 </header>
 
 <div class="hero">
@@ -828,11 +1156,17 @@ def dashboard():
 <div class="stat-row">{stat_row_html}</div>
 
 <div class="card">
+  <div class="section-head">Active allocation</div>
+  <div class="alloc-bar">{alloc_bar_html}</div>
+  <div class="alloc-legend">{alloc_legend_html}</div>
+</div>
+
+<div class="card">
   <div class="section-head">Equity curve</div>
   <div class="chart-shell"><canvas id="equityChart"></canvas></div>
   <div class="chart-legend">
-    <span><span class="swatch" style="background:#5fd4a8;"></span>Strategy</span>
-    <span><span class="swatch" style="background:#4e5563; border-top:1px dashed #4e5563; height:0;"></span>SPY buy &amp; hold</span>
+    <span><span class="swatch" style="background:#00ff9d;"></span>Strategy</span>
+    <span><span class="swatch" style="background:#565c6b; border-top:1px dashed #565c6b; height:0;"></span>SPY buy &amp; hold</span>
   </div>
 </div>
 
@@ -847,13 +1181,13 @@ def dashboard():
   <section class="card">
     <div class="section-head">Recent closed trades</div>
     <table>
-      <tr><th>Ticker</th><th>Opened</th><th>Closed</th><th>P/L</th></tr>
+      <tr><th>Ticker</th><th>Opened</th><th>Closed</th><th>Exit</th><th>P/L</th><th>P/L %</th></tr>
       {trade_rows}
     </table>
   </section>
 </div>
 
-<footer>Paper trading only &mdash; simulated with no real funds. Not investment advice.</footer>
+<footer>Paper trading only &mdash; simulated with no real funds. Not investment advice. Intraday prices are best-effort and may lag or briefly be unavailable outside market hours.</footer>
 """
 
     chart_data = json.dumps({
@@ -861,9 +1195,13 @@ def dashboard():
         "equity": [c["equity"] for c in curve],
         "spy": [c.get("spy_equity") for c in curve],
     })
-    scripts = f"<script>window.__CHART_DATA__ = {chart_data};</script><script>{DASHBOARD_JS}</script>"
+    scripts = (
+        f"<script>window.__CHART_DATA__ = {chart_data};</script>"
+        f"<script>{DASHBOARD_JS}</script>"
+        f"<script>{REFRESH_TICKER_JS}</script>"
+    )
 
-    return Response(_page_shell(body, scripts), mimetype="text/html")
+    return Response(_page_shell(body, scripts, auto_refresh=True), mimetype="text/html")
 
 
 if __name__ == "__main__":
