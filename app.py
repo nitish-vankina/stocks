@@ -313,8 +313,17 @@ def run_job():
         return {"status": "already ran today", "run_date": run_date}
 
     close_df = fetch_price_history()
-    prices = {t: float(close_df[t].dropna().iloc[-1]) for t in TICKERS if t in close_df}
-    spy_price = float(close_df[BENCHMARK].dropna().iloc[-1]) if BENCHMARK in close_df else None
+
+    # Safely extract latest price for each ticker
+    prices = {}
+    for t in TICKERS:
+        if t in close_df and not close_df[t].dropna().empty:
+            prices[t] = float(close_df[t].dropna().iloc[-1])
+
+    # Safely extract SPY price
+    spy_price = None
+    if BENCHMARK in close_df and not close_df[BENCHMARK].dropna().empty:
+        spy_price = float(close_df[BENCHMARK].dropna().iloc[-1])
 
     target_weights = compute_target_weights_today(close_df)
     state = rebalance(state, target_weights, prices, run_date)
